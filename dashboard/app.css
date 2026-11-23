@@ -1,4 +1,4 @@
-/* Token Radar, radar-2 theme. Ink navy on warm paper, one blue accent for
+/* Token Radar, radar-3 theme. Ink navy on warm paper, one blue accent for
    actions, amber for implied value, green/red only for growth. */
 :root {
   --canvas: #f6f4ee;
@@ -84,6 +84,8 @@ th .num { text-align: right; }
 .name b { display: block; }
 .name .sub { display: block; }
 .watch { display: inline-block; font-size: 11px; font-weight: 700; color: var(--amber); background: var(--amber-soft); border-radius: 4px; padding: 1px 6px; margin-left: 6px; vertical-align: 1px; }
+.rank-cell { display: flex; align-items: baseline; gap: 6px; justify-content: flex-end; }
+.delta { font-size: 11px; font-weight: 700; font-family: var(--font-num); }
 .implied { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
 .bar { width: 90px; height: 8px; background: var(--surface-2); border-radius: 4px; overflow: hidden; flex: none; }
 .bar i { display: block; height: 100%; background: var(--amber); }
@@ -96,7 +98,7 @@ th .num { text-align: right; }
 
 .model { margin-top: 16px; padding: 20px 22px; }
 .model h2 { margin-bottom: 6px; }
-.formula { font-family: var(--font-num); font-size: 13px; background: var(--surface-2); border-radius: 8px; padding: 12px 14px; margin: 12px 0; overflow-x: auto; white-space: nowrap; }
+.formula { font-family: var(--font-num); font-size: 13px; background: var(--surface-2); border-radius: 8px; padding: 12px 14px; margin: 12px 0; overflow-wrap: anywhere; line-height: 1.7; }
 .model p { max-width: 90ch; }
 .mult-table { width: 100%; margin-top: 12px; }
 .mult-table th, .mult-table td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--border); font-size: 13px; }

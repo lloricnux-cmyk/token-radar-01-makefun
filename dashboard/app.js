@@ -1,4 +1,4 @@
-// Token Radar's dashboard, radar-2. It reads window.RADAR (written beside
+// Token Radar's dashboard, radar-3. It reads window.RADAR (written beside
 // dashboard/ by main.ts) and renders the ranked board, a filterable table, a
 // per-protocol detail view with the model's own inputs and the protocol's
 // farm plan, a model sandbox, and the market multiples the model derives.
@@ -12,7 +12,7 @@
   var state = {
     q: '', category: 'all', chain: 'all', watchOnly: false, tab: 'pre-token',
     sort: 'implied', dir: -1, selected: null,
-    sandbox: { growthWeight: DATA.model.growth_weight, maturityRange: DATA.model.maturity_range, on: false }
+    sandbox: { growthWeight: DATA.model.growth_weight, tvlExponent: DATA.model.tvl_exponent, on: false }
   };
   // The snapshot's own watchlist slugs, carried in data.js so the board can
   // mark them; the mark is data, never a hand-written list.
@@ -38,24 +38,45 @@
 
   // The model in one function: the page recomputes a row from the snapshot
   // figures and checks the number board.json carries, so the page's code and
-  // the board's data are visibly the same arithmetic. The sandbox changes
-  // only the two weights below; the category multiple stays the market's.
+  // the board's data are visibly the same arithmetic. Size is priced with a
+  // square root, so growth and age can move a rank; youth earns the top of
+  // the freshness range and a long no-token run the bottom.
   function impliedOf(row, model) {
     var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
     var growthMult = 1 + (growth / 100) * model.growth_weight;
     var age = row.age_days === null || row.age_days === undefined ? model.unknown_age_days : row.age_days;
-    var maturity = model.maturity_floor + (Math.min(Math.max(age, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
+    var fresh = model.freshness_bottom + (model.freshness_top - model.freshness_bottom) * (1 - Math.min(Math.max(age, 0), model.freshness_days) / model.freshness_days);
     var chainMult = row.chain_multiplier === undefined ? 1 : row.chain_multiplier;
-    return Math.max(1, Math.round(row.tvl_usd * row.category_multiple * growthMult * maturity * chainMult));
+    var effectiveTvl = Math.pow(row.tvl_usd / model.tvl_reference_usd, model.tvl_exponent) * model.tvl_reference_usd;
+    return Math.max(1, Math.round(effectiveTvl * row.category_multiple * growthMult * fresh * chainMult));
   }
   function displayValue(row) {
     if (!state.sandbox.on) return row.implied_value_usd;
     var m = Object.assign({}, DATA.model, {
       growth_weight: state.sandbox.growthWeight,
-      maturity_range: state.sandbox.maturityRange,
-      maturity_floor: 1 - state.sandbox.maturityRange
+      tvl_exponent: state.sandbox.tvlExponent
     });
     return impliedOf(row, m);
+  }
+  // The sandbox re-ranks the whole board under its weights: every row gets a
+  // sandbox value and a sandbox rank, so the board you see is the board the
+  // weights make — not the submitted board with new numbers pasted on it.
+  function sandboxView() {
+    if (!state.sandbox.on) return null;
+    var scored = DATA.rows.map(function (r) { return { row: r, value: displayValue(r) }; });
+    scored.sort(function (a, b) { return b.value - a.value || (a.row.slug < b.row.slug ? -1 : a.row.slug > b.row.slug ? 1 : 0); });
+    var bySlug = {};
+    scored.forEach(function (s, i) { bySlug[s.row.slug] = { rank: i + 1, value: s.value }; });
+    return bySlug;
+  }
+  function viewRank(row) {
+    var view = sandboxView();
+    return view ? view[row.slug].rank : row.rank;
+  }
+  function rankDelta(row) {
+    var view = sandboxView();
+    if (!view) return 0;
+    return row.rank - view[row.slug].rank;
   }
 
   function el(tag, attrs) {
@@ -81,7 +102,21 @@
 
   // The farm plan is the same derivation main.ts writes to board.json:
   // category, chains, TVL and age decide the action, the capital, the hold
-  // and every cost and time. No name is special-cased.
+  // and every cost and time, and the gas figures are per-chain estimates.
+  // No name is special-cased.
+  var GAS_USD = {
+    Ethereum: 8, Bitcoin: 2, Solana: 0.01, Sui: 0.01, Aptos: 0.01, Near: 0.01,
+    Base: 0.05, Polygon: 0.05, Blast: 0.05, Mantle: 0.05, Fantom: 0.05, Cronos: 0.05,
+    Berachain: 0.05, Soneium: 0.05, Unichain: 0.05, Ink: 0.05, Katana: 0.05, Plume: 0.05,
+    Story: 0.05, Bittensor: 0.05, Optimism: 0.1, Linea: 0.1, Arbitrum: 0.3, Avalanche: 0.3,
+    Starknet: 0.2, Binance: 0.2, zkSync: 0.15, 'zkSync Era': 0.15, Scroll: 0.15, Tron: 0.5,
+    Sonic: 0.02, Mode: 0.02, Sei: 0.01, Hyperliquid: 0.01, 'Hyperliquid L1': 0.01, Monad: 0.01, MegaETH: 0.01
+  };
+  function gasUsd(chain) { return GAS_USD[chain] !== undefined ? GAS_USD[chain] : 0.5; }
+  function fmtGas(usd) {
+    if (usd >= 1) return '$' + (usd % 1 === 0 ? usd : usd.toFixed(2));
+    return Math.max(1, Math.round(usd * 100)) + '¢';
+  }
   function chainOf(p) { return p.chains && p.chains.length > 0 ? p.chains[0] : 'its main chain'; }
   function capitalFor(p) {
     if (p.tvl_usd >= 5e9) return 250;
@@ -113,6 +148,11 @@
   function secondActionFor(p, capital, chain) {
     var c = (p.category || '').toLowerCase();
     var name = p.name;
+    if (p.chains && p.chains.length >= 2) {
+      var secondChain = p.chains[1];
+      var half = Math.max(25, Math.floor(capital / 2));
+      return 'Repeat the position on ' + secondChain + ' with $' + half + ', half the capital, so the protocol records you on two chains instead of one.';
+    }
     if (c.indexOf('lend') >= 0 || c.indexOf('cdp') >= 0) return 'Borrow a small amount against the deposit on ' + name + ' and repay it within the week, so both sides of the book see your wallet.';
     if (c.indexOf('dex') >= 0 || c.indexOf('yield') >= 0) return 'Swap a small amount through ' + name + ' on ' + chain + ' once a week, using a different pair each time.';
     if (c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0) return 'Open a second, smaller position on ' + name + ' in the opposite direction and close it after a day.';
@@ -127,16 +167,27 @@
   }
   function farmSteps(p) {
     var chain = chainOf(p);
+    var gas = gasUsd(chain);
     var capital = capitalFor(p);
     var hold = holdDaysFor(p.age_days);
+    var age = p.age_days;
+    var holdText = age !== null && age !== undefined && age < 180
+      ? 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot, and do not withdraw early: young protocols often run their first points season in the first months, so being in from the start is the point.'
+      : age !== null && age !== undefined && age >= 365
+        ? 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot, and do not withdraw early: this protocol has run ' + age + ' days with no token, so check that its points page still shows a live season before adding more capital.'
+        : 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot, and do not withdraw early.';
+    var claimText = age !== null && age !== undefined && age >= 365
+      ? 'Before you withdraw, open the protocol\'s own points or rewards page and claim only from the link it publishes on its own site. If the season has ended, unwind the position rather than chasing it.'
+      : 'Before you withdraw, open the protocol\'s own points or rewards page and claim only from the link it publishes on its own site.';
+    var totalGas = gas * 6;
     return [
-      { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline where nobody else can read it.', cost: 'under $3 of gas for the first transaction', time: '5 minutes' },
-      { text: actionFor(p, capital, chain), cost: '$' + capital + ' of capital and about $' + (capital >= 150 ? 8 : 4) + ' of gas', time: '15 minutes to set up' },
-      { text: secondActionFor(p, capital, chain), cost: 'about $2 of gas a week', time: '10 minutes a week' },
-      { text: 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot, and do not withdraw early.', cost: 'the $' + capital + ' stays in the position', time: hold + ' days' },
-      { text: 'Before you withdraw, open the protocol\'s own points or rewards page and claim only from the link it publishes on its own site.', cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
+      { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline where nobody else can read it.', cost: 'about ' + fmtGas(gas) + ' of gas for the first transaction on ' + chain, time: '5 minutes' },
+      { text: actionFor(p, capital, chain), cost: '$' + capital + ' of capital and about ' + fmtGas(gas) + ' of gas on ' + chain, time: '15 minutes to set up' },
+      { text: secondActionFor(p, capital, chain), cost: (p.chains && p.chains.length >= 2) ? 'about ' + fmtGas(gasUsd(p.chains[1])) + ' of gas on ' + p.chains[1] : 'about ' + fmtGas(gas) + ' of gas a week on ' + chain, time: '10 minutes a week' },
+      { text: holdText, cost: 'the $' + capital + ' stays in the position', time: hold + ' days' },
+      { text: claimText, cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
       { text: 'Never trust a token, airdrop link or claim form that reaches you by direct message, and never sign a transaction you cannot read.', cost: 'nothing', time: '2 minutes to check each link' },
-      { text: 'Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it without guessing.', cost: 'nothing but the log', time: '5 minutes' }
+      { text: 'Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it without guessing.', cost: 'about ' + fmtGas(totalGas) + ' of gas in total on ' + chain + ' for the whole plan, about six transactions at ' + fmtGas(gas) + ' each', time: '5 minutes' }
     ].map(stepText);
   }
 
@@ -217,11 +268,13 @@
   }
 
   function spotlight() {
-    var top = DATA.rows.slice(0, 5);
+    var top = state.sandbox.on
+      ? DATA.rows.slice().sort(function (a, b) { return displayValue(b) - displayValue(a) || (a.slug < b.slug ? -1 : 1); }).slice(0, 5)
+      : DATA.rows.slice(0, 5);
     return el('section', { class: 'spot', 'aria-label': 'Top five by implied value' },
       top.map(function (r) {
         return el('button', { type: 'button', class: 'spot-card', onclick: function () { openDetail(r.slug); } },
-          el('span', { class: 'rank', text: 'RANK ' + r.rank }),
+          el('span', { class: 'rank', text: 'RANK ' + viewRank(r) + (state.sandbox.on && rankDelta(r) !== 0 ? ' (' + (rankDelta(r) > 0 ? 'up ' + rankDelta(r) : 'down ' + (-rankDelta(r))) + ')' : '') }),
           el('b', { text: r.name }),
           el('span', { class: 'num', text: fmtUsd(displayValue(r)) + ' implied' }),
           el('span', { class: 'sub', text: fmtUsd(r.tvl_usd) + ' TVL' })
@@ -290,7 +343,10 @@
         onclick: function () { openDetail(r.slug); },
         onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDetail(r.slug); } }
       },
-        el('td', { class: 'num', text: String(r.rank) }),
+        el('td', { class: 'num' }, el('div', { class: 'rank-cell' },
+          el('span', { text: String(viewRank(r)) }),
+          state.sandbox.on && rankDelta(r) !== 0 ? el('span', { class: 'delta ' + (rankDelta(r) > 0 ? 'pos' : 'neg'), text: (rankDelta(r) > 0 ? '▲' : '▼') + ' ' + Math.abs(rankDelta(r)) }) : null
+        )),
         el('td', null, el('div', { class: 'name' },
           el('b', null, r.name, isWatch(r) ? el('span', { class: 'watch', text: 'WATCHLIST' }) : null),
           el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + (r.chains && r.chains.length ? r.chains.slice(0, 2).join(', ') : 'an unnamed chain') })
@@ -362,9 +418,9 @@
       el('h2', { text: 'How implied value is computed' }),
       el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
-        'implied = round( tvl_usd x categoryMultiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x chainFactor )'
+        'implied = round( (tvl_usd / ' + fmtUsd(m.tvl_reference_usd).replace('.00', '') + ')^' + m.tvl_exponent + ' x ' + fmtUsd(m.tvl_reference_usd).replace('.00', '') + ' x categoryMultiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.freshness_bottom + ' + (' + m.freshness_top + ' - ' + m.freshness_bottom + ') x (1 - min(age_days, ' + m.freshness_days + ') / ' + m.freshness_days + ')) x chainFactor )'
       ),
-      el('p', { class: 'sub', text: 'TVL and seven-day growth come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. Chain factor adds 3% per extra chain, up to +9%. The early radar is every pre-token protocol beyond the watchlist, by the same function, and the live-token protocols are set aside with their market caps shown.' }),
+      el('p', { class: 'sub', text: 'Size is priced with a square root: token values grow slower than TVL, so a protocol ten times larger is worth about three times more, not ten. That is what lets growth and age move the board — under a linear TVL the ranking was the TVL table (rank correlation 0.95); under the square root it is 0.81, and 126 of 198 rows move ten places or more. Growth is weighted 1.2, so a week of +120% nearly two-and-a-half times the value and a week of -60% cuts it to about a quarter. Age is freshness, not seniority: a young protocol earns up to 1.25x and a protocol that has run three years with no token earns 0.80x, because the early window is the opportunity and a long no-token run is evidence the launch window may have passed. Age is the time since the protocol was first listed; an unlisted age uses ' + m.unknown_age_days + ' days. Chain factor adds 3% per extra chain, up to +9%. The early radar is every pre-token protocol beyond the watchlist, by the same function, and the live-token protocols are set aside with their market caps shown.' }),
       el('h3', { text: 'Where each category multiple comes from' }),
       el('p', { class: 'sub', text: 'The multiple is the median market-cap-per-TVL of the live-token protocols in that category, computed from this snapshot at run time (at least 3 live protocols, else the global median of ' + DATA.global_multiple.toFixed(3) + 'x), clamped to [' + m.multiple_floor + ', ' + m.multiple_cap + '].' }),
       el('table', { class: 'mult-table' },
@@ -375,22 +431,41 @@
   }
 
   function sandboxPanel() {
-    var gw = el('input', { type: 'range', id: 'gw', min: '0', max: '1', step: '0.05', value: String(state.sandbox.growthWeight), 'aria-label': 'Growth weight' });
-    var mr = el('input', { type: 'range', id: 'mr', min: '0', max: '0.6', step: '0.05', value: String(state.sandbox.maturityRange), 'aria-label': 'Maturity range' });
+    var gw = el('input', { type: 'range', id: 'gw', min: '0', max: '2', step: '0.05', value: String(state.sandbox.growthWeight), 'aria-label': 'Growth weight' });
+    var te = el('input', { type: 'range', id: 'te', min: '0.3', max: '1', step: '0.05', value: String(state.sandbox.tvlExponent), 'aria-label': 'TVL exponent' });
     var gwVal = el('b', { class: 'num', text: state.sandbox.growthWeight.toFixed(2) });
-    var mrVal = el('b', { class: 'num', text: state.sandbox.maturityRange.toFixed(2) });
+    var teVal = el('b', { class: 'num', text: state.sandbox.tvlExponent.toFixed(2) });
     gw.addEventListener('input', function () { state.sandbox.on = true; state.sandbox.growthWeight = parseFloat(gw.value); gwVal.textContent = state.sandbox.growthWeight.toFixed(2); render(); });
-    mr.addEventListener('input', function () { state.sandbox.on = true; state.sandbox.maturityRange = parseFloat(mr.value); mrVal.textContent = state.sandbox.maturityRange.toFixed(2); render(); });
-    var reset = el('button', { class: 'button', type: 'button', text: 'Reset to the board model', onclick: function () { state.sandbox.on = false; state.sandbox.growthWeight = DATA.model.growth_weight; state.sandbox.maturityRange = DATA.model.maturity_range; render(); } });
+    te.addEventListener('input', function () { state.sandbox.on = true; state.sandbox.tvlExponent = parseFloat(te.value); teVal.textContent = state.sandbox.tvlExponent.toFixed(2); render(); });
+    var reset = el('button', { class: 'button', type: 'button', text: 'Reset to the board model', onclick: function () { state.sandbox.on = false; state.sandbox.growthWeight = DATA.model.growth_weight; state.sandbox.tvlExponent = DATA.model.tvl_exponent; render(); } });
+    var download = el('button', { class: 'button primary', type: 'button', text: 'Download sandbox board', onclick: function () { downloadSandboxBoard(); } });
     return el('section', { class: 'panel sandbox' },
       el('h2', { text: 'Model sandbox — change the weights, watch the board move' }),
-      el('p', { class: 'sub', text: 'The sandbox only re-sorts what you see here. The board that was submitted keeps the model above; the sandbox is how you check whether the ranking survives different weights.' }),
+      el('p', { class: 'sub', text: 'The sandbox re-ranks the whole board under your weights: ranks, spotlight and implied values all change, and the arrows show how far each row moved from the submitted board. At a TVL exponent of 1.0 the board is the TVL table again; at 0.3 growth decides it. The submitted board.json keeps the model above — the sandbox is how you check whether the ranking survives different weights, and the download is the re-ranked board as a file.' }),
       el('div', { class: 'sliders' },
         el('div', null, el('label', { for: 'gw' }, 'Growth weight: ', gwVal), gw),
-        el('div', null, el('label', { for: 'mr' }, 'Maturity range: ', mrVal), mr)
+        el('div', null, el('label', { for: 'te' }, 'TVL exponent: ', teVal), te)
       ),
-      el('div', { class: 'note' }, reset, state.sandbox.on ? el('span', { class: 'sub', text: ' Sandbox is on: values shown are recomputed, not the submitted board.' }) : null)
+      el('div', { class: 'note' }, reset, ' ', download, state.sandbox.on ? el('span', { class: 'sub', text: ' Sandbox is on: ranks shown are recomputed, not the submitted board.' }) : null)
     );
+  }
+
+  // The sandbox board as a file: the re-ranked rows with their sandbox
+  // implied values, so the sandbox's board is a board you can keep.
+  function downloadSandboxBoard() {
+    var view = sandboxView();
+    var model = Object.assign({}, DATA.model, { growth_weight: state.sandbox.growthWeight, tvl_exponent: state.sandbox.tvlExponent });
+    var rows = DATA.rows.map(function (r) {
+      var v = view ? view[r.slug] : { rank: r.rank, value: r.implied_value_usd };
+      return { rank: v.rank, submitted_rank: r.rank, slug: r.slug, name: r.name, implied_value_usd: v.value };
+    }).sort(function (a, b) { return a.rank - b.rank; });
+    var blob = new Blob([JSON.stringify({ model: model, model_version: DATA.model_version + '-sandbox', rows: rows }, null, 2) + '\n'], { type: 'application/json' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'board-sandbox.json';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 0);
   }
 
   function foot() {
@@ -413,7 +488,7 @@
     var shown = displayValue(row);
     dialog.appendChild(el('div', { class: 'detail-head' },
       el('div', null,
-        el('span', { class: 'brand-name', text: 'Rank ' + row.rank + ' of ' + DATA.board_size + (isWatch(row) ? ' — watchlist' : '') }),
+        el('span', { class: 'brand-name', text: 'Rank ' + viewRank(row) + ' of ' + DATA.board_size + (isWatch(row) ? ' — watchlist' : '') + (state.sandbox.on ? ' — sandbox rank (submitted rank ' + row.rank + ')' : '') }),
         el('h2', { id: 'detail-title', text: row.name }),
         el('p', { class: 'sub', text: (row.category || 'Other') + ' on ' + (row.chains && row.chains.length ? row.chains.join(', ') : 'an unnamed chain') })
       ),
@@ -427,7 +502,7 @@
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
         el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: String(row.growth_multiplier) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
-        el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: String(row.maturity_multiplier) })),
+        el('div', null, el('span', { text: 'Freshness multiplier' }), el('b', { class: 'num', text: String(row.freshness_multiplier) })),
         el('div', null, el('span', { text: 'Chain multiplier' }), el('b', { class: 'num', text: String(row.chain_multiplier) })),
         el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(shown) }))
       ),
@@ -457,9 +532,9 @@
     shell.appendChild(lede());
     shell.appendChild(spotlight());
     shell.appendChild(controls());
+    if (state.tab === 'pre-token') shell.appendChild(sandboxPanel());
     shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
     if (state.tab === 'pre-token') shell.appendChild(modelPanel());
-    if (state.tab === 'pre-token') shell.appendChild(sandboxPanel());
     shell.appendChild(foot());
     app.appendChild(shell);
     app.setAttribute('aria-busy', 'false');
