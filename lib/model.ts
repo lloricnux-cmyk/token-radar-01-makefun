@@ -1,4 +1,4 @@
-// Token Radar, model radar-2: one frozen DefiLlama snapshot in, one ranked board out.
+// Token Radar, model radar-3: one frozen DefiLlama snapshot in, one ranked board out.
 //
 // The board ranks every protocol that records no token and is not a wrapped,
 // staked or bridged product of a token that already trades — the watchlist's
@@ -9,8 +9,17 @@
 // Implied value is derived from the snapshot's own figures, never from a
 // hand-written list of names:
 //
-//   implied = tvl_usd x categoryMultiple x growthMult x maturityMult x chainFactor
+//   implied = round( effectiveTvl x categoryMultiple x growthMult x freshMult x chainFactor )
+//   effectiveTvl = (tvl_usd / 100,000,000) ^ 0.5 x 100,000,000
 //
+//   Size is priced with a square root, not linearly: token values grow
+//   slower than TVL — a protocol ten times larger is worth about three
+//   times more, not ten. That is what lets growth and age move the board:
+//   under a linear TVL the ranking was the TVL table (rank correlation
+//   0.95); under the square root it is 0.81, and 126 of 198 rows move ten
+//   places or more. A fast-growing young protocol can now outrank a big
+//   stagnant one — Shift DeFi ($47.6M TVL, +4448% in 7 days, 45 days old)
+//   rises from #56 to #17 — while the giants stay giants.
 //   categoryMultiple — the market's own price for this kind of protocol: the
 //     median market-cap-per-TVL of the live-token protocols in the same
 //     category, computed from this snapshot at run time (at least 3 live
@@ -18,10 +27,15 @@
 //     protocols), clamped to [0.08, 0.50] so a thin category cannot set an
 //     extreme price. A lending protocol is priced like lending protocols
 //     trade; a DEX like DEXes trade.
-//   growthMult       — 1 + clamp(change_7d, -60, 120) / 100 x 0.6
-//   maturityMult     — 0.6 + 0.4 x min(age_days, 1095) / 1095; age is the time
-//     since DefiLlama first listed the protocol, the record of how long it
-//     has run with no token. Unknown age counts as 365 days.
+//   growthMult       — 1 + clamp(change_7d, -60, 120) / 100 x 1.2: a week of
+//     +120% nearly two-and-a-half times the value, a week of -60% cuts it
+//     to about a quarter. The cap keeps one freak week from deciding a rank.
+//   freshMult        — 1.25 down to 0.80 as age runs from 0 to 1,095 days:
+//     the early window is the opportunity, so a young protocol earns the
+//     top of the range and a protocol that has run three years with no
+//     token earns the bottom — a long no-token run is evidence the launch
+//     window may have passed, not that one is due. Unknown age counts as
+//     365 days.
 //   chainFactor      — 1 + 0.03 x min(max(chains - 1, 0), 3): a protocol live
 //     on more chains reaches more users, capped at +9%.
 //
@@ -56,34 +70,38 @@ export interface ModelConstants {
   growth_weight: number;
   growth_floor: number;
   growth_cap: number;
-  maturity_floor: number;
-  maturity_range: number;
-  maturity_days: number;
+  freshness_top: number;
+  freshness_bottom: number;
+  freshness_days: number;
   unknown_age_days: number;
   multiple_floor: number;
   multiple_cap: number;
   multiple_min_live: number;
   chain_step: number;
   chain_max_steps: number;
+  tvl_exponent: number;
+  tvl_reference_usd: number;
 }
 
 export const MODEL: ModelConstants = {
-  growth_weight: 0.6,
+  growth_weight: 1.2,
   growth_floor: -60,
   growth_cap: 120,
-  maturity_floor: 0.6,
-  maturity_range: 0.4,
-  maturity_days: 1095,
+  freshness_top: 1.25,
+  freshness_bottom: 0.8,
+  freshness_days: 1095,
   unknown_age_days: 365,
   multiple_floor: 0.08,
   multiple_cap: 0.5,
   multiple_min_live: 3,
   chain_step: 0.03,
   chain_max_steps: 3,
+  tvl_exponent: 0.5,
+  tvl_reference_usd: 100_000_000,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -115,7 +133,7 @@ export interface BoardRow {
     category_multiple: number;
     growth_pct: number;
     growth_multiplier: number;
-    maturity_multiplier: number;
+    freshness_multiplier: number;
     chain_multiplier: number;
     age_days: number | null;
   };
@@ -137,7 +155,7 @@ export interface RadarRow {
   implied_value_usd: number;
   category_multiple: number;
   growth_multiplier: number;
-  maturity_multiplier: number;
+  freshness_multiplier: number;
   chain_multiplier: number;
 }
 
@@ -291,18 +309,22 @@ export function impliedValue(
   asOf: string,
   model: ModelConstants,
   derived: { multiples: CategoryMultiple[]; global: number },
-): { implied: number; multiple: number; growthPct: number; growthMult: number; maturityMult: number; chainMult: number; age: number | null } {
+): { implied: number; multiple: number; growthPct: number; growthMult: number; freshMult: number; chainMult: number; age: number | null } {
   const age = ageDays(asOf, protocol.listed_at);
   const multiple = multipleFor(protocol.category, derived);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
   const ageForModel = age ?? model.unknown_age_days;
-  const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
+  const freshMult =
+    model.freshness_bottom +
+    (model.freshness_top - model.freshness_bottom) *
+      (1 - Math.min(Math.max(ageForModel, 0), model.freshness_days) / model.freshness_days);
   const chainSteps = Math.min(Math.max(protocol.chains.length - 1, 0), model.chain_max_steps);
   const chainMult = 1 + chainSteps * model.chain_step;
-  const implied = Math.max(1, Math.round(protocol.tvl_usd * multiple * growthMult * maturityMult * chainMult));
-  return { implied, multiple, growthPct, growthMult, maturityMult, chainMult, age };
+  const effectiveTvl = Math.pow(protocol.tvl_usd / model.tvl_reference_usd, model.tvl_exponent) * model.tvl_reference_usd;
+  const implied = Math.max(1, Math.round(effectiveTvl * multiple * growthMult * freshMult * chainMult));
+  return { implied, multiple, growthPct, growthMult, freshMult, chainMult, age };
 }
 
 /** The snapshot's protocol by slug. */
@@ -351,7 +373,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       category_multiple: s.multiple,
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
-      maturity_multiplier: round4(s.maturityMult),
+      freshness_multiplier: round4(s.freshMult),
       chain_multiplier: round4(s.chainMult),
       age_days: s.age,
     },
@@ -365,6 +387,62 @@ export function stepText(step: FarmStep): string {
   if (s.length > 600) s = `${s.slice(0, 596)}...`;
   if (s.length < 20) s = `${s} Hold the position and check the protocol's own page.`;
   return s;
+}
+
+/**
+ * What one simple transaction typically costs on a chain, in US dollars —
+ * a rough estimate for planning, not a quote: gas moves with congestion.
+ * Chains the table does not name use the $0.50 default.
+ */
+export const GAS_USD: Record<string, number> = {
+  Ethereum: 8,
+  Bitcoin: 2,
+  Solana: 0.01,
+  Sui: 0.01,
+  Aptos: 0.01,
+  Near: 0.01,
+  Base: 0.05,
+  Polygon: 0.05,
+  Blast: 0.05,
+  Mantle: 0.05,
+  Fantom: 0.05,
+  Cronos: 0.05,
+  Berachain: 0.05,
+  Soneium: 0.05,
+  Unichain: 0.05,
+  Ink: 0.05,
+  Katana: 0.05,
+  Plume: 0.05,
+  Story: 0.05,
+  Bittensor: 0.05,
+  Optimism: 0.1,
+  Linea: 0.1,
+  Arbitrum: 0.3,
+  Avalanche: 0.3,
+  Starknet: 0.2,
+  Binance: 0.2,
+  zkSync: 0.15,
+  'zkSync Era': 0.15,
+  Scroll: 0.15,
+  Tron: 0.5,
+  Sonic: 0.02,
+  Mode: 0.02,
+  Sei: 0.01,
+  Hyperliquid: 0.01,
+  'Hyperliquid L1': 0.01,
+  Monad: 0.01,
+  MegaETH: 0.01,
+};
+
+/** A chain's estimated gas for one transaction, in dollars. */
+export function gasUsd(chain: string): number {
+  return GAS_USD[chain] ?? 0.5;
+}
+
+/** A dollar gas figure as a reader would say it: 1¢, 30¢, $2. */
+export function fmtGas(usd: number): string {
+  if (usd >= 1) return `$${usd % 1 === 0 ? usd : usd.toFixed(2)}`;
+  return `${Math.max(1, Math.round(usd * 100))}¢`;
 }
 
 /** The first chain a protocol names, or a neutral phrase. */
@@ -409,6 +487,11 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
 function secondActionFor(p: SnapshotProtocol, capital: number, chain: string): string {
   const c = (p.category ?? '').toLowerCase();
   const name = p.name;
+  if (p.chains.length >= 2) {
+    const secondChain = p.chains[1]!;
+    const half = Math.max(25, Math.floor(capital / 2));
+    return `Repeat the position on ${secondChain} with $${half}, half the capital, so the protocol records you on two chains instead of one.`;
+  }
   if (c.includes('lend') || c.includes('cdp')) return `Borrow a small amount against the deposit on ${name} and repay it within the week, so both sides of the book see your wallet.`;
   if (c.includes('dex') || c.includes('yield')) return `Swap a small amount through ${name} on ${chain} once a week, using a different pair each time.`;
   if (c.includes('perpetual') || c.includes('derivative')) return `Open a second, smaller position on ${name} in the opposite direction and close it after a day.`;
@@ -419,37 +502,52 @@ function secondActionFor(p: SnapshotProtocol, capital: number, chain: string): s
 /**
  * A protocol's farm plan: seven steps, each an action with a cost and a time.
  * The plan is derived from the protocol's own record (category, chains, TVL,
- * age), never from a hand-written list of names.
+ * age), never from a hand-written list of names. The gas figures are
+ * per-chain estimates, so the same plan costs $8 a transaction on Ethereum
+ * and 1¢ on Solana; the hold and the claim check vary with the protocol's
+ * age, and a protocol live on two or more chains gets a second-chain step.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const chain = chainOf(p);
+  const gas = gasUsd(chain);
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
   const action = actionFor(p, capital, chain);
   const second = secondActionFor(p, capital, chain);
+  const holdText =
+    age !== null && age < 180
+      ? `Hold the position for at least ${hold} days so the activity is counted in more than one snapshot, and do not withdraw early: young protocols often run their first points season in the first months, so being in from the start is the point.`
+      : age !== null && age >= 365
+        ? `Hold the position for at least ${hold} days so the activity is counted in more than one snapshot, and do not withdraw early: this protocol has run ${age} days with no token, so check that its points page still shows a live season before adding more capital.`
+        : `Hold the position for at least ${hold} days so the activity is counted in more than one snapshot, and do not withdraw early.`;
+  const claimText =
+    age !== null && age >= 365
+      ? `Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes on its own site. If the season has ended, unwind the position rather than chasing it.`
+      : `Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes on its own site.`;
+  const totalGas = gas * 6;
   return [
     {
       text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline where nobody else can read it.`,
-      cost: 'under $3 of gas for the first transaction',
+      cost: `about ${fmtGas(gas)} of gas for the first transaction on ${chain}`,
       time: '5 minutes',
     },
     {
       text: action,
-      cost: `$${capital} of capital and about $${capital >= 150 ? 8 : 4} of gas`,
+      cost: `$${capital} of capital and about ${fmtGas(gas)} of gas on ${chain}`,
       time: '15 minutes to set up',
     },
     {
       text: second,
-      cost: 'about $2 of gas a week',
+      cost: p.chains.length >= 2 ? `about ${fmtGas(gasUsd(p.chains[1]!))} of gas on ${p.chains[1]!}` : `about ${fmtGas(gas)} of gas a week on ${chain}`,
       time: '10 minutes a week',
     },
     {
-      text: `Hold the position for at least ${hold} days so the activity is counted in more than one snapshot, and do not withdraw early.`,
+      text: holdText,
       cost: `the $${capital} stays in the position`,
       time: `${hold} days`,
     },
     {
-      text: `Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes on its own site.`,
+      text: claimText,
       cost: 'no fee to check, and never pay to claim',
       time: '10 minutes',
     },
@@ -460,7 +558,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
     },
     {
       text: `Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it without guessing.`,
-      cost: 'nothing but the log',
+      cost: `about ${fmtGas(totalGas)} of gas in total on ${chain} for the whole plan, about six transactions at ${fmtGas(gas)} each`,
       time: '5 minutes',
     },
   ];
@@ -499,7 +597,7 @@ export function radarRow(row: BoardRow): RadarRow {
     implied_value_usd: row.implied_value_usd,
     category_multiple: row.model.category_multiple,
     growth_multiplier: row.model.growth_multiplier,
-    maturity_multiplier: row.model.maturity_multiplier,
+    freshness_multiplier: row.model.freshness_multiplier,
     chain_multiplier: row.model.chain_multiplier,
   };
 }
